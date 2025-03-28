@@ -1,10 +1,19 @@
 # folder where the data is downloaded
-data_root: DATA_ROOT
+data_root: /cluster/eriador/lhoellein/scannetpp
 
 # Set True to render depth for iphone frames
-render_iphone: True
+render_iphone: False
+render_iphone_undistorted: False
+render_iphone_imu: True
 # Set True to render depth for dslr frames
 render_dslr: False
+render_dslr_undistorted: False
+render_novel_views: False
+
+imu_every_nth_frame: 2  # 30 fps
+downscale_factor: 8
+save_rendered_rgb: False
+save_rendered_depth: True
 
 splits: [nvs_sem_train, nvs_sem_val]
 

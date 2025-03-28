@@ -19,15 +19,44 @@ import zlib
 import numpy as np
 import imageio as iio
 import lz4.block
+import os
 
 from common.scene_release import ScannetppScene_Release
 from common.utils.utils import run_command, load_yaml_munch, load_json, read_txt_list
 
 
 def extract_rgb(scene):
+    # rename existing folder
+    # if scene.iphone_rgb_dir.exists():
+    #     print(f"rename {scene.iphone_rgb_dir} to {scene.iphone_rgb_dir}_old")
+    #     os.rename(str(scene.iphone_rgb_dir), str(scene.iphone_rgb_dir) + '_old')
+
+    # delete existing folder
+    # if scene.iphone_rgb_dir.exists():
+    #     print(f"delete {scene.iphone_rgb_dir}")
+    #     import shutil
+    #     shutil.rmtree(str(scene.iphone_rgb_dir))
+
     scene.iphone_rgb_dir.mkdir(parents=True, exist_ok=True)
+
+    # files = [x for x in scene.iphone_rgb_dir.iterdir() if Path(x).is_file()]
+    # if len(files) > 0:
+    #     print(f"delete {len(files)} existing images in {scene.iphone_rgb_dir}")
+    #     for f in files:
+    #         os.remove(str(f))
+
+    # cmd = f"ffmpeg -i {scene.iphone_video_path} -r 10 -vf \"scale=iw/2:ih/2\" -start_number 0 -q:v 1 {scene.iphone_rgb_dir}/frame_%06d.jpg"
     cmd = f"ffmpeg -i {scene.iphone_video_path} -start_number 0 -q:v 1 {scene.iphone_rgb_dir}/frame_%06d.jpg"
     run_command(cmd, verbose=True)
+
+    # from torchcodec.decoders import VideoDecoder
+    # from PIL import Image
+    # device = "cpu"  # or e.g. "cuda" !
+    # decoder = VideoDecoder(scene.iphone_video_path, device=device)
+    # for idx, img in enumerate(decoder):
+    #     img = img.permute(1, 2, 0).cpu().numpy()
+    #     Image.fromarray(img).save(f"{scene.iphone_rgb_dir}/frame_{idx:06d}.jpg")
+    
 
 def extract_masks(scene):
     scene.iphone_video_mask_dir.mkdir(parents=True, exist_ok=True)
@@ -94,7 +123,9 @@ def main(args):
 
     # get the options to process
     # go through each scene
-    for scene_id in tqdm(scene_ids, desc='scene'):
+    scene_ids = scene_ids[args.offset::args.stride]
+    pbar = tqdm(scene_ids, desc="scene")
+    for scene_id in pbar:
         scene = ScannetppScene_Release(scene_id, data_root=Path(cfg.data_root) / 'data')
 
         if cfg.extract_rgb:
@@ -106,9 +137,23 @@ def main(args):
         if cfg.extract_depth:
             extract_depth(scene)
 
+        if cfg.get("only_keep_transforms_frames", False):
+            # clean up all frames that do not appear in the transforms file
+            transforms = load_json(scene.iphone_nerfstudio_transform_path)
+            frames = [f['file_path'] for f in transforms['frames']]
+            folders = [scene.iphone_rgb_dir, scene.iphone_depth_dir, scene.iphone_video_mask_dir]
+            for folder in folders:
+                if not folder.exists():
+                    continue
+                for f in folder.iterdir():
+                    if f.name not in frames:
+                        os.remove(str(f))
+
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument('config_file', help='Path to config file')
+    p.add_argument("--stride", type=int, default=1, help="stride for scene subdivision")
+    p.add_argument("--offset", type=int, default=0, help="offset for scene subdivision")
     args = p.parse_args()
 
     main(args)

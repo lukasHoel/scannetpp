@@ -15,20 +15,27 @@ from common.utils.utils import load_yaml_munch, load_json, read_txt_list
 
 def compute_undistort_intrinsic(K, height, width, distortion_params):
     assert len(distortion_params.shape) == 1
-    assert distortion_params.shape[0] == 4  # OPENCV_FISHEYE has k1, k2, k3, k4
+    assert distortion_params.shape[0] == 4  # iphone transforms file has k1, k2, p1, p2
 
-    new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+    new_K, roi = cv2.getOptimalNewCameraMatrix(
         K,
         distortion_params,
         (width, height),
-        np.eye(3),
-        balance=0.0,
+        0,
+        (width, height),
+        centerPrincipalPoint=True
     )
-    # raise ValueError(new_K, height / 2.0, width / 2.0)
-    # # Make the cx and cy to be the center of the image
-    # new_K[0, 2] = width / 2.0
-    # new_K[1, 2] = height / 2.0
-    return new_K
+    x, y, w, h = roi
+    if x > 1 or y > 1:
+        raise ValueError("The undistorted image will be cropped. This is not expected.", roi)
+    if w < (width - 1) or h < (height - 1):
+        raise ValueError("The undistorted image will be cropped. This is not expected.", roi)
+    # Make the cx and cy to be the center of the image. 
+    # when using centerPrincipalPoint=True, the cx and cy are already at the center, but the convention is that (0, 0) is the center of the top-left pixel.
+    # instead, we want the convention that (0, 0) is the top-left corner of the image-plane. e.g. change 255.5 to 256.0
+    new_K[0, 2] = width / 2.0
+    new_K[1, 2] = height / 2.0
+    return new_K, roi
 
 
 def undistort_frames(
@@ -38,50 +45,34 @@ def undistort_frames(
     width,
     distortion_params,
     input_image_dir,
-    input_mask_dir,
     out_image_dir,
-    out_mask_dir,
 ):
-    new_K = compute_undistort_intrinsic(K, height, width, distortion_params)
-    map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+    new_K, roi = compute_undistort_intrinsic(K, height, width, distortion_params)
+    map1, map2 = cv2.initUndistortRectifyMap(
         K, distortion_params, np.eye(3), new_K, (width, height), cv2.CV_32FC1
     )
 
-    for frame in tqdm(frames, desc="frame"):
-        image_path = Path(input_image_dir) / frame["file_path"]
-        image = cv2.imread(str(image_path))
-        undistorted_image = cv2.remap(
-            image,
-            map1,
-            map2,
-            interpolation=cv2.INTER_LINEAR,
-            # borderMode=cv2.BORDER_REFLECT_101,
-        )
-        out_image_path = Path(out_image_dir) / frame["file_path"]
-        out_image_path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(out_image_path), undistorted_image)
-
-        # Mask
-        mask_path = Path(input_mask_dir) / frame["mask_path"]
-        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-        if np.all(mask > 0):
-            # No invalid pixels. Just use empty mask
-            undistorted_mask = np.zeros((height, width), dtype=np.uint8) + 255
-        else:
-            undistorted_mask = cv2.remap(
-                mask,
+    if input_image_dir.exists():
+        for frame in tqdm(frames, desc="frame"):
+            image_path = Path(input_image_dir) / frame["file_path"]
+            if not image_path.exists():
+                continue
+            image = cv2.imread(str(image_path))
+            undistorted_image = cv2.remap(
+                image,
                 map1,
                 map2,
                 interpolation=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=255,
+                # borderMode=cv2.BORDER_REFLECT_101,
             )
-            # Filter the mask valid: 255, invalid: 0
-            undistorted_mask[undistorted_mask < 255] = 0
 
-        out_mask_path = Path(out_mask_dir) / frame["mask_path"]
-        out_mask_path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(out_mask_path), undistorted_mask)
+            # crop the image
+            # x, y, w, h = roi
+            # undistorted_image = undistorted_image[y:y+h, x:x+w]
+
+            out_image_path = Path(out_image_dir) / frame["file_path"]
+            out_image_path.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(out_image_path), undistorted_image)
     return new_K
 
 
@@ -95,9 +86,14 @@ def update_transforms_json(transforms, new_K, new_height, new_width):
     new_transforms["cy"] = new_K[1, 2]
     # The undistortion will be PINHOLE and have no distortion paramaters
     new_transforms["camera_model"] = "PINHOLE"
-    for key in ("k1", "k2", "k3", "k4"):
+    for key in ("k1", "k2", "p1", "p2"):
         if key in new_transforms:
             new_transforms[key] = 0.0
+    for f in new_transforms["frames"]:
+        f.pop("mask_path", None)
+    if "test_frames" in new_transforms:
+        for f in new_transforms["test_frames"]:
+            f.pop("mask_path", None)
     return new_transforms
 
 
@@ -121,32 +117,25 @@ def main(args):
         scene = ScannetppScene_Release(scene_id, data_root=Path(cfg.data_root) / "data")
         input_image_dir = cfg.get("input_image_dir", None)
         if input_image_dir is None:
-            input_image_dir = scene.dslr_resized_dir
+            input_image_dir = scene.iphone_rgb_dir
         else:
-            input_image_dir = scene.dslr_dir / input_image_dir
-
-        input_mask_dir = cfg.get("input_mask_dir", None)
-        if input_mask_dir is None:
-            input_mask_dir = scene.dslr_resized_mask_dir
-        else:
-            input_mask_dir = scene.dslr_dir / input_mask_dir
+            input_image_dir = scene.iphone_data_dir / input_image_dir
 
         input_transforms_path = cfg.get("input_transforms_path", None)
         if input_transforms_path is None:
-            input_transforms_path = scene.dslr_nerfstudio_transform_path
+            input_transforms_path = scene.iphone_nerfstudio_transform_path
         else:
-            input_transforms_path = scene.dslr_dir / input_transforms_path
+            input_transforms_path = scene.iphone_data_dir / input_transforms_path
 
-        out_image_dir = scene.dslr_dir / cfg.out_image_dir
-        out_mask_dir = scene.dslr_dir / cfg.out_mask_dir
-        out_transforms_path = scene.dslr_dir / cfg.out_transforms_path
+        out_image_dir = scene.iphone_data_dir / cfg.out_image_dir
+        out_transforms_path = scene.iphone_data_dir / cfg.out_transforms_path
 
         transforms = load_json(input_transforms_path)
 
-        if os.path.exists(str(out_transforms_path)) and False:
+        if os.path.exists(str(out_transforms_path)):
             try:
                 x = load_json(out_transforms_path)
-                if "frames" in x and len(x["frames"]) == len(transforms["frames"]) and "test_frames" in x and len(x["test_frames"]) == len(transforms["test_frames"]):
+                if "frames" in x and len(x["frames"]) == len(transforms["frames"]) and out_image_dir.exists():
                     print(f"skip {scene_id}, already undistorted")
                     continue
                 else:
@@ -175,16 +164,14 @@ def main(args):
             [
                 float(transforms["k1"]),
                 float(transforms["k2"]),
-                float(transforms["k3"]),
-                float(transforms["k4"]),
+                float(transforms["p1"]),
+                float(transforms["p2"]),
             ]
         )
         fx = float(transforms["fl_x"])
         fy = float(transforms["fl_y"])
-        cx = float(transforms["cx"]) - 0.5
-        cy = float(transforms["cy"]) - 0.5
-        # subtract 0.5 because the intrinsics are in colmap/opengl convention, but we use opencv convention for undistortion
-        # afterwards, new_K is in opencv convention and we directly save it out like that. meaning the transforms_undistorted.json is a different convention than the original transforms.json!
+        cx = float(transforms["cx"])
+        cy = float(transforms["cy"])
         K = np.array(
             [
                 [fx, 0, cx],
@@ -200,9 +187,7 @@ def main(args):
             width,
             distortion_params,
             input_image_dir,
-            input_mask_dir,
             out_image_dir,
-            out_mask_dir,
         )
         new_trasforms = update_transforms_json(transforms, new_K, height, width)
         out_transforms_path.parent.mkdir(parents=True, exist_ok=True)
