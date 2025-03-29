@@ -164,3 +164,4 @@ cython_debug/
 submit*.sh
 outputs
 renders
+logs

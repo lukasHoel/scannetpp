@@ -222,10 +222,41 @@ def scale_intrinsics_opencv(fx, fy, cx, cy, h, w, downscale_factor: int):
     return fx, fy, cx, cy, h, w
 
 
+def check_if_scene_complete(scene_id, output_dir, render_devices, save_rendered_rgb, save_rendered_depth, downscale_factor, imu_every_nth_frame, render_novel_views):
+    if render_novel_views:
+        return False
+    
+    # check if all is rendered already and could skip
+    complete = True
+    for device in render_devices:
+        if "iphone_imu" in device:
+            rgb_dir = Path(output_dir) / scene_id / "iphone" / f"imu_downscaled_{downscale_factor}_render_rgb"
+            depth_dir = Path(output_dir) / scene_id / "iphone" / f"imu_downscaled_{downscale_factor}_render_depth"
+            imu_file = Path(output_dir) / scene_id / "iphone" / "pose_intrinsic_imu.json"
+            imu_file = json.load(open(imu_file))
+            src_indices = [i for i in range(len(imu_file.keys())) if i % imu_every_nth_frame == 0]
+            num_src_rgb = len(src_indices)
+        else:
+            image_type = "dslr" if "dslr" in device else "iphone"
+            out_dir_prefix = "undistorted_" if "undistorted" in device else ""
+            src_folder = "undistorted_images" if "undistorted" in device else "images" if "dslr" in device else "rgb"
+            src_rgb_dir = Path(output_dir) / scene_id / image_type / src_folder
+            rgb_dir = Path(output_dir) / scene_id / image_type / f"{out_dir_prefix}render_rgb"
+            depth_dir = Path(output_dir) / scene_id / image_type / f"{out_dir_prefix}render_depth"
+            num_src_rgb = len(os.listdir(str(src_rgb_dir))) if os.path.exists(src_rgb_dir) else 0
+
+        num_rend_rgb = len(os.listdir(str(rgb_dir))) if os.path.exists(rgb_dir) else 0
+        num_rend_depth = len(os.listdir(str(depth_dir))) if os.path.exists(depth_dir) else 0
+        if (num_src_rgb != num_rend_rgb and save_rendered_rgb) or (num_src_rgb != num_rend_depth and save_rendered_depth):
+            complete = False
+            break
+
+    return complete
+
 def main(args):
     cfg = load_yaml_munch(args.config_file)
 
-    # get the scenes to process
+    # get all scenes to process
     if cfg.get("scene_ids"):
         scene_ids = cfg.scene_ids
     elif cfg.get("splits"):
@@ -234,12 +265,14 @@ def main(args):
             split_path = Path(cfg.data_root) / "splits" / f"{split}.txt"
             scene_ids += read_txt_list(split_path)
 
+    # setup output dir
     output_dir = cfg.get("output_dir")
     if output_dir is None:
         # default to data folder in data_root
         output_dir = Path(cfg.data_root) / "data"
     output_dir = Path(output_dir)
 
+    # setup render devices
     render_devices = []
     if cfg.get("render_dslr", False):
         render_devices.append("dslr")
@@ -252,51 +285,30 @@ def main(args):
     if cfg.get("render_iphone_imu", False):
         render_devices.append("iphone_imu")
 
-    # go through each scene
-    scene_ids = scene_ids[args.offset::args.stride]
-    if args.max_iter > 0:
-        scene_ids = scene_ids[:args.max_iter]
-    pbar = tqdm(scene_ids, desc="scene")
+    # setup render options
     save_rendered_rgb = cfg.get("save_rendered_rgb", True)
     save_rendered_depth = cfg.get("save_rendered_depth", True)
     downscale_factor = cfg.get("downscale_factor", 1)
     imu_every_nth_frame = cfg.get("imu_every_nth_frame", 1)
+    render_novel_views = cfg.get("render_novel_views", False)
+
+    # filter remaining scene_ids
+    print("Filtering scene ids")
+    filtered_scene_ids = [scene_id for scene_id in scene_ids if check_if_scene_complete(scene_id, output_dir, render_devices, save_rendered_rgb, save_rendered_depth, downscale_factor, imu_every_nth_frame, render_novel_views)]
+    print(f"{len(scene_ids) - len(filtered_scene_ids)} scenes already rendered, skipping")
+    scene_ids = filtered_scene_ids
+
+    # go through each scene
+    print("Rendering scenes with offset=", args.offset, "and stride=", args.stride)
+    scene_ids = scene_ids[args.offset::args.stride]
+    pbar = tqdm(scene_ids, desc="scene")
+    executed_iters = 0
     for scene_id in pbar:
-        pbar.set_description_str(f"scene {scene_id}")
         scene = ScannetppScene_Release(scene_id, data_root=Path(cfg.data_root) / "data")
-
-        # quick check if all is rendered already and could skip
-        if not cfg.get("render_novel_views", False):
-            can_skip = True
-            for device in render_devices:
-                if "iphone_imu" in device:
-                    rgb_dir = Path(output_dir) / scene_id / "iphone" / f"imu_downscaled_{downscale_factor}_render_rgb"
-                    depth_dir = Path(output_dir) / scene_id / "iphone" / f"imu_downscaled_{downscale_factor}_render_depth"
-                    imu_file = Path(output_dir) / scene_id / "iphone" / "pose_intrinsic_imu.json"
-                    imu_file = json.load(open(imu_file))
-                    src_indices = [i for i in range(len(imu_file.keys())) if i % imu_every_nth_frame == 0]
-                    num_src_rgb = len(src_indices)
-                else:
-                    image_type = "dslr" if "dslr" in device else "iphone"
-                    out_dir_prefix = "undistorted_" if "undistorted" in device else ""
-                    src_folder = "undistorted_images" if "undistorted" in device else "images" if "dslr" in device else "rgb"
-                    src_rgb_dir = Path(output_dir) / scene_id / image_type / src_folder
-                    rgb_dir = Path(output_dir) / scene_id / image_type / f"{out_dir_prefix}render_rgb"
-                    depth_dir = Path(output_dir) / scene_id / image_type / f"{out_dir_prefix}render_depth"
-                    num_src_rgb = len(os.listdir(str(src_rgb_dir))) if os.path.exists(src_rgb_dir) else 0
-
-                num_rend_rgb = len(os.listdir(str(rgb_dir))) if os.path.exists(rgb_dir) else 0
-                num_rend_depth = len(os.listdir(str(depth_dir))) if os.path.exists(depth_dir) else 0
-                if (num_src_rgb != num_rend_rgb and save_rendered_rgb) or (num_src_rgb != num_rend_depth and save_rendered_depth):
-                    can_skip = False
-                    break
-            if can_skip:
-                print("already rendered, skip", scene_id)
-                continue
-        
         render_engine = renderpy.Render()
         render_engine.setupMesh(str(scene.scan_mesh_path))
         for device in render_devices:
+            pbar.set_description_str(f"scene {scene_id}, device {device}")
             if "dslr" in device:
                 cameras, images, points3D = read_model(scene.dslr_colmap_dir, ".txt")
             else:
@@ -362,7 +374,7 @@ def main(args):
             near = cfg.get("near", 0.05)
             far = cfg.get("far", 20.0)
 
-            if cfg.get("render_novel_views", False):
+            if render_novel_views:
                 assert "imu" not in device, "Novel view rendering not supported for IMU data"
                 # render novel views
                 rgb_dir = Path(output_dir) / scene_id / device_out_dir / f"{out_dir_prefix}render_rgb_novel"
@@ -443,7 +455,7 @@ def main(args):
                     out_file_name = image_name.split("/")[-1]
                     rgb_out_file_path = rgb_dir / (out_file_name + image_ext)
                     depth_out_file_path = depth_dir / (out_file_name + ".png")
-                    
+
                     # check if already rendered
                     if (rgb_out_file_path.exists() or not save_rendered_rgb) and (depth_out_file_path.exists() or not save_rendered_depth):
                         continue
@@ -490,6 +502,9 @@ def main(args):
                         depth = (depth.astype(np.float32) * 1000).clip(0, 65535).astype(np.uint16)
                         imageio.imwrite(depth_out_file_path, depth)
 
+        executed_iters += 1
+        if args.max_iter > 0 and executed_iters >= args.max_iter:
+            break
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
